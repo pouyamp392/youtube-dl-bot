@@ -18,6 +18,8 @@ from telegram.ext import (
 from dotenv import load_dotenv
 import yt_dlp
 from yt_dlp.version import __version__ as YTDLP_VERSION
+import sys
+os.environ["PATH"] = os.path.dirname(sys.executable) + os.pathsep + os.environ.get("PATH", "")
 
 load_dotenv()
 
