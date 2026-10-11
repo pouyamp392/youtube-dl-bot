@@ -9,7 +9,7 @@ from tempfile import TemporaryDirectory
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
 
-from telegram import Update
+from telegram import Update, LinkPreviewOptions
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -34,6 +34,11 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 # /etc/secrets/cookies.txt  — نه محتوای کوکی!)
 COOKIES_PATH = os.getenv("COOKIES_PATH", "cookies.txt")
 
+# برای ارسال ویدئوهای بزرگ‌تر از ۵۰ مگابایت (اختیاری):
+# API_ID و API_HASH را از my.telegram.org بگیر و توی Environment بگذار.
+API_ID = os.getenv("API_ID")
+API_HASH = os.getenv("API_HASH")
+
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN not found")
 
@@ -48,17 +53,23 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
-# نسخه‌ی yt-dlp توی لاگ چاپ می‌شه تا مطمئن بشی آپدیت واقعاً نصب شده
 logger.info("yt-dlp version: %s", YTDLP_VERSION)
 logger.info(
     "Cookie file '%s' exists: %s",
     COOKIES_PATH,
     os.path.exists(COOKIES_PATH),
 )
-
 logger.info("deno path: %s", shutil.which("deno"))
 
+# سقف ارسال با Bot API معمولی
 MAX_FILE_SIZE = 49 * 1024 * 1024
+
+# سقف ویدئوهای بزرگ (پیش‌فرض ۵۰۰ مگابایت؛ سرور رایگان رم/دیسک/زمان محدود دارد)
+LARGE_MAX_MB = int(os.getenv("LARGE_MAX_MB", "500"))
+LARGE_MAX_SIZE = LARGE_MAX_MB * 1024 * 1024
+
+# کلاینت Telethon (برای ارسال فایل بزرگ) داخل post_init ساخته می‌شود
+tclient = None
 
 
 # ---------------- Cookie Helper ----------------
@@ -84,6 +95,20 @@ def prepare_cookie_file(src: str, dst: Path) -> int:
             lines.append("\t".join(parts))
     dst.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return len(lines) - 1
+
+
+def format_for_limit(limit: int) -> str:
+    """فقط فرمت‌هایی که هم تصویر و هم صدا دارند و زیر سقف حجم‌اند."""
+    return (
+        f"best[ext=mp4][filesize<{limit}]/"
+        f"best[ext=mp4][filesize_approx<{limit}]/"
+        f"best[filesize<{limit}]/"
+        f"best[filesize_approx<{limit}]"
+    )
+
+
+def is_format_unavailable(err: Exception) -> bool:
+    return "Requested format is not available" in str(err)
 
 
 # ---------------- Health Server ----------------
@@ -122,6 +147,70 @@ def is_youtube_url(url: str) -> bool:
         }
     except Exception:
         return False
+
+
+# ---------------- Large upload (Telethon) ----------------
+
+async def post_init(application: Application):
+    """کلاینت Telethon را با همان توکن ربات راه می‌اندازد (برای فایل‌های بزرگ)."""
+    global tclient
+
+    if not (API_ID and API_HASH):
+        logger.info("API_ID/API_HASH not set: large uploads disabled")
+        return
+
+    try:
+        from telethon import TelegramClient, events
+        from telethon.sessions import StringSession
+
+        client = TelegramClient(StringSession(), int(API_ID), API_HASH)
+        await client.start(bot_token=BOT_TOKEN)
+
+        # وجود یک handler باعث می‌شود آپدیت‌ها پردازش و کاربرها کش شوند
+        @client.on(events.NewMessage(incoming=True))
+        async def _cache_entities(event):
+            pass
+
+        tclient = client
+        logger.info("Telethon ready: large uploads enabled (up to %s MB)", LARGE_MAX_MB)
+    except Exception:
+        tclient = None
+        logger.exception("Telethon failed to start: large uploads disabled")
+
+
+async def send_large_video(chat_id: int, path: Path, info: dict, caption: str):
+    """ارسال ویدئوی بزرگ با Telethon. در صورت خطا exception می‌دهد."""
+    from telethon.tl.types import DocumentAttributeVideo
+
+    # کاربر باید توسط Telethon دیده شده باشد؛ چند بار تلاش می‌کنیم
+    entity = None
+    for _ in range(5):
+        try:
+            entity = await tclient.get_input_entity(chat_id)
+            break
+        except ValueError:
+            await asyncio.sleep(2)
+
+    if entity is None:
+        raise RuntimeError("Telethon could not resolve this chat")
+
+    attrs = [
+        DocumentAttributeVideo(
+            duration=int(info.get("duration") or 0),
+            w=int(info.get("width") or 0),
+            h=int(info.get("height") or 0),
+            supports_streaming=True,
+        )
+    ]
+
+    await tclient.send_file(
+        entity,
+        str(path),
+        caption=caption,
+        attributes=attrs,
+        supports_streaming=True,
+        force_document=False,
+    )
 
 
 # ---------------- Bot Commands ----------------
@@ -171,8 +260,6 @@ async def handle_url(
                 "no_warnings": False,
                 "noplaylist": True,
                 "socket_timeout": 30,
-                "format": "best[ext=mp4]/best",
-                "max_filesize": MAX_FILE_SIZE,
                 # معادل --remote-components ejs:github در خط فرمان
                 "remote_components": ["ejs:github"],
             }
@@ -196,7 +283,7 @@ async def handle_url(
             # Download runs outside the async event loop.
             # چند کلاینت یوتیوب را پشت‌سرهم امتحان می‌کنیم؛ روی آی‌پی
             # دیتاسنتر (مثل Render) بعضی کلاینت‌ها کمتر بات‌چک می‌شوند.
-            def download():
+            def download(limit: int):
                 attempts = [
                     # (اسم، extractor_args، استفاده از کوکی؟)
                     ("default", None, True),  # پیش‌فرض yt-dlp + کوکی
@@ -206,29 +293,88 @@ async def handle_url(
                 last_err = None
                 for name, args, use_cookies in attempts:
                     opts = dict(ydl_opts)
+                    opts["format"] = format_for_limit(limit)
                     if args:
                         opts["extractor_args"] = args
                     if not use_cookies:
                         opts.pop("cookiefile", None)
                     try:
-                        logger.info("Trying client: %s", name)
+                        logger.info("Trying client: %s (limit %s MB)", name, limit // 1024 // 1024)
                         with yt_dlp.YoutubeDL(opts) as ydl:
-                            ydl.download([url])
+                            info = ydl.extract_info(url, download=True)
                         logger.info("Client '%s' worked", name)
-                        return
+                        return info
                     except Exception as e:
                         last_err = e
                         logger.warning(
                             "Client '%s' failed: %s", name, str(e)[:200]
                         )
+                        # مشکل «حجم زیاد» به کلاینت ربطی ندارد؛ بقیه را امتحان نکن
+                        if is_format_unavailable(e):
+                            raise
                 raise last_err
 
-            await asyncio.to_thread(download)
+            # لینک مستقیم، برای وقتی که ویدئو از همه‌ی سقف‌ها بزرگ‌تر است
+            def get_direct_link():
+                opts = dict(ydl_opts)
+                opts["format"] = "best[ext=mp4]/best"
+                opts["skip_download"] = True
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    return ydl.extract_info(url, download=False)
 
+            info = None
+
+            # مرحله ۱: نسخه‌ی کوچک‌تر از ۵۰ مگابایت (ارسال عادی)
+            try:
+                info = await asyncio.to_thread(download, MAX_FILE_SIZE)
+            except Exception as e:
+                if not is_format_unavailable(e):
+                    raise
+
+            # مرحله ۲: ویدئوی بزرگ‌تر، با Telethon (اگر فعال باشد)
+            if info is None and tclient is not None:
+                await status.edit_text(
+                    "⏳ ویدئو بزرگ‌تر از ۵۰ مگابایت است؛ در حال دانلود نسخه‌ی کامل "
+                    "(ممکن است چند دقیقه طول بکشد)..."
+                )
+                try:
+                    info = await asyncio.to_thread(download, LARGE_MAX_SIZE)
+                except Exception as e:
+                    if not is_format_unavailable(e):
+                        raise
+
+            # مرحله ۳: هیچ فرمتی زیر سقف نبود → لینک مستقیم
+            if info is None:
+                await status.edit_text(
+                    "⏳ ویدئو از سقف مجاز بزرگ‌تر است؛ در حال ساخت لینک مستقیم..."
+                )
+                link_info = await asyncio.to_thread(get_direct_link)
+                direct = link_info.get("url")
+                size = link_info.get("filesize") or link_info.get("filesize_approx")
+                size_txt = f"{size / 1024 / 1024:.0f} MB" if size else "نامشخص"
+                title = (link_info.get("title") or "")[:100]
+
+                if not direct or len(direct) > 3500:
+                    await status.edit_text(
+                        "❌ این ویدئو خیلی بزرگ است و لینک مستقیم هم ساخته نشد."
+                    )
+                    return
+
+                await status.edit_text(
+                    f"⚠️ حجم ویدئو زیاد است ({size_txt}).\n"
+                    f"{title}\n\n"
+                    "لینک مستقیم دانلود (موقتی است و ممکن است فقط چند ساعت کار کند):\n"
+                    f"{direct}",
+                    link_preview_options=LinkPreviewOptions(is_disabled=True),
+                )
+                return
+
+            # فقط فایل‌های کامل ویدیویی؛ فایل‌های ناقص (.part) و کوکی رد می‌شوند
+            video_exts = {".mp4", ".mkv", ".webm", ".mov"}
             files = [
                 p for p in Path(tmpdir).iterdir()
                 if p.is_file()
-                and p.name != "cookies.txt"
+                and p.suffix.lower() in video_exts
                 and p.stat().st_size > 0
             ]
 
@@ -242,27 +388,35 @@ async def handle_url(
                 files,
                 key=lambda p: p.stat().st_size
             )
-
-            if filename.stat().st_size > MAX_FILE_SIZE:
-                await status.edit_text(
-                    "❌ حجم ویدئو بیشتر از حد مجاز این ربات است."
-                )
-                return
+            file_size = filename.stat().st_size
 
             await status.edit_text(
                 "📤 ویدئو آماده است؛ در حال ارسال..."
             )
 
-            with filename.open("rb") as video:
-                await context.bot.send_video(
-                    chat_id=message.chat_id,
-                    video=video,
-                    supports_streaming=True,
-                    caption="🎬 ویدئوی شما آماده است.",
-                    read_timeout=120,
-                    write_timeout=120,
-                    connect_timeout=30,
-                    pool_timeout=30,
+            if file_size <= MAX_FILE_SIZE:
+                # ارسال عادی با Bot API
+                with filename.open("rb") as video:
+                    await context.bot.send_video(
+                        chat_id=message.chat_id,
+                        video=video,
+                        supports_streaming=True,
+                        duration=int(info.get("duration") or 0) or None,
+                        width=info.get("width"),
+                        height=info.get("height"),
+                        caption="🎬 ویدئوی شما آماده است.",
+                        read_timeout=120,
+                        write_timeout=120,
+                        connect_timeout=30,
+                        pool_timeout=30,
+                    )
+            else:
+                # ارسال فایل بزرگ با Telethon
+                await send_large_video(
+                    message.chat_id,
+                    filename,
+                    info,
+                    "🎬 ویدئوی شما آماده است.",
                 )
 
             await status.delete()
@@ -283,7 +437,12 @@ def main():
         daemon=True,
     ).start()
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(
