@@ -24,7 +24,8 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# مسیر فایل کوکی (روی هاست می‌تونی مسیر Secret File رو اینجا بدی)
+# مسیر فایل کوکی (روی Render مقدارش مسیر Secret File است:
+# /etc/secrets/cookies.txt  — نه محتوای کوکی!)
 COOKIES_PATH = os.getenv("COOKIES_PATH", "cookies.txt")
 
 if not BOT_TOKEN:
@@ -34,6 +35,10 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
+
+# جلوگیری از چاپ توکن ربات توی لاگ (httpx آدرس کامل درخواست را لاگ می‌کند)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
