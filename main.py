@@ -1,4 +1,6 @@
 import os
+import sys
+import shutil
 import logging
 import asyncio
 import threading
@@ -18,10 +20,13 @@ from telegram.ext import (
 from dotenv import load_dotenv
 import yt_dlp
 from yt_dlp.version import __version__ as YTDLP_VERSION
-import sys
-os.environ["PATH"] = os.path.dirname(sys.executable) + os.pathsep + os.environ.get("PATH", "")
 
 load_dotenv()
+
+# مسیر bin محیط ویرچوال را به PATH اضافه می‌کنیم تا yt-dlp بتواند `deno` را پیدا کند
+os.environ["PATH"] = (
+    os.path.dirname(sys.executable) + os.pathsep + os.environ.get("PATH", "")
+)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
@@ -50,6 +55,8 @@ logger.info(
     COOKIES_PATH,
     os.path.exists(COOKIES_PATH),
 )
+
+logger.info("deno path: %s", shutil.which("deno"))
 
 MAX_FILE_SIZE = 49 * 1024 * 1024
 
@@ -192,9 +199,9 @@ async def handle_url(
             def download():
                 attempts = [
                     # (اسم، extractor_args، استفاده از کوکی؟)
+                    ("default", None, True),  # پیش‌فرض yt-dlp + کوکی
                     ("tv", {"youtube": {"player_client": ["tv"]}}, False),
                     ("mweb", {"youtube": {"player_client": ["mweb"]}}, False),
-                    ("default", None, True),  # پیش‌فرض yt-dlp + کوکی
                 ]
                 last_err = None
                 for name, args, use_cookies in attempts:
