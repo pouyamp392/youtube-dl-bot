@@ -1,4 +1,5 @@
 import os
+import shutil
 import logging
 import asyncio
 import threading
@@ -21,6 +22,9 @@ import yt_dlp
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+
+# مسیر فایل کوکی (روی هاست می‌تونی مسیر Secret File رو اینجا بدی)
+COOKIES_PATH = os.getenv("COOKIES_PATH", "cookies.txt")
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN not found")
@@ -123,6 +127,16 @@ async def handle_url(
                 "max_filesize": MAX_FILE_SIZE,
             }
 
+            # کپی کوکی داخل پوشه‌ی موقت، چون yt-dlp می‌خواد
+            # بعد از اجرا دوباره توی فایل کوکی بنویسه و ممکنه
+            # فایل اصلی (مثلاً Secret File) فقط‌خواندنی باشه.
+            if os.path.exists(COOKIES_PATH):
+                cookie_copy = Path(tmpdir) / "cookies.txt"
+                shutil.copy(COOKIES_PATH, cookie_copy)
+                ydl_opts["cookiefile"] = str(cookie_copy)
+            else:
+                logger.warning("Cookie file not found: %s", COOKIES_PATH)
+
             # Download runs outside the async event loop.
             def download():
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -132,7 +146,9 @@ async def handle_url(
 
             files = [
                 p for p in Path(tmpdir).iterdir()
-                if p.is_file() and p.stat().st_size > 0
+                if p.is_file()
+                and p.name != "cookies.txt"
+                and p.stat().st_size > 0
             ]
 
             if not files:
@@ -172,7 +188,7 @@ async def handle_url(
 
     except Exception as e:
         logger.exception("YouTube download failed")
-    
+
         await status.edit_text(
             f"❌ خطا:\n{str(e)[:700]}"
         )
@@ -202,4 +218,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
