@@ -1,5 +1,4 @@
 import os
-import shutil
 import logging
 import asyncio
 import threading
@@ -51,6 +50,31 @@ logger.info(
 )
 
 MAX_FILE_SIZE = 49 * 1024 * 1024
+
+
+# ---------------- Cookie Helper ----------------
+
+def prepare_cookie_file(src: str, dst: Path) -> int:
+    """فایل کوکی را به فرمت درست Netscape (با Tab) تبدیل می‌کند.
+
+    اگر موقع Paste کردن Tabها به فاصله تبدیل شده باشند یا خط اول
+    افتاده باشد، اینجا درست می‌شود. تعداد کوکی‌های معتبر را برمی‌گرداند.
+    """
+    lines = ["# Netscape HTTP Cookie File"]
+    with open(src, encoding="utf-8", errors="ignore") as f:
+        for raw in f:
+            line = raw.replace("\ufeff", "").strip()
+            if not line:
+                continue
+            # کامنت‌ها رد می‌شوند، ولی #HttpOnly_ یک کوکی واقعی است
+            if line.startswith("#") and not line.startswith("#HttpOnly_"):
+                continue
+            parts = line.split(None, 6)  # جداکردن با هر نوع فاصله، حداکثر ۷ ستون
+            if len(parts) < 7:
+                continue
+            lines.append("\t".join(parts))
+    dst.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return len(lines) - 1
 
 
 # ---------------- Health Server ----------------
@@ -149,8 +173,14 @@ async def handle_url(
             # فایل اصلی (مثلاً Secret File) فقط‌خواندنی باشه.
             if os.path.exists(COOKIES_PATH):
                 cookie_copy = Path(tmpdir) / "cookies.txt"
-                shutil.copy(COOKIES_PATH, cookie_copy)
-                ydl_opts["cookiefile"] = str(cookie_copy)
+                count = prepare_cookie_file(COOKIES_PATH, cookie_copy)
+                logger.info("Valid cookie lines found: %s", count)
+                if count > 0:
+                    ydl_opts["cookiefile"] = str(cookie_copy)
+                else:
+                    logger.warning(
+                        "Cookie file has no valid cookie lines; running without cookies"
+                    )
             else:
                 logger.warning("Cookie file not found: %s", COOKIES_PATH)
 
