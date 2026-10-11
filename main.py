@@ -18,6 +18,7 @@ from telegram.ext import (
 )
 from dotenv import load_dotenv
 import yt_dlp
+from yt_dlp.version import __version__ as YTDLP_VERSION
 
 load_dotenv()
 
@@ -35,6 +36,14 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
+
+# نسخه‌ی yt-dlp توی لاگ چاپ می‌شه تا مطمئن بشی آپدیت واقعاً نصب شده
+logger.info("yt-dlp version: %s", YTDLP_VERSION)
+logger.info(
+    "Cookie file '%s' exists: %s",
+    COOKIES_PATH,
+    os.path.exists(COOKIES_PATH),
+)
 
 MAX_FILE_SIZE = 49 * 1024 * 1024
 
@@ -119,12 +128,15 @@ async def handle_url(
 
             ydl_opts = {
                 "outtmpl": output_template,
-                "quiet": True,
-                "no_warnings": True,
+                # لاگ کامل‌تر برای پیدا کردن دلیل خطا
+                "quiet": False,
+                "no_warnings": False,
                 "noplaylist": True,
                 "socket_timeout": 30,
                 "format": "best[ext=mp4]/best",
                 "max_filesize": MAX_FILE_SIZE,
+                # معادل --remote-components ejs:github در خط فرمان
+                "remote_components": ["ejs:github"],
             }
 
             # کپی کوکی داخل پوشه‌ی موقت، چون yt-dlp می‌خواد
