@@ -185,9 +185,34 @@ async def handle_url(
                 logger.warning("Cookie file not found: %s", COOKIES_PATH)
 
             # Download runs outside the async event loop.
+            # چند کلاینت یوتیوب را پشت‌سرهم امتحان می‌کنیم؛ روی آی‌پی
+            # دیتاسنتر (مثل Render) بعضی کلاینت‌ها کمتر بات‌چک می‌شوند.
             def download():
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    ydl.download([url])
+                attempts = [
+                    # (اسم، extractor_args، استفاده از کوکی؟)
+                    ("tv", {"youtube": {"player_client": ["tv"]}}, False),
+                    ("mweb", {"youtube": {"player_client": ["mweb"]}}, False),
+                    ("default", None, True),  # پیش‌فرض yt-dlp + کوکی
+                ]
+                last_err = None
+                for name, args, use_cookies in attempts:
+                    opts = dict(ydl_opts)
+                    if args:
+                        opts["extractor_args"] = args
+                    if not use_cookies:
+                        opts.pop("cookiefile", None)
+                    try:
+                        logger.info("Trying client: %s", name)
+                        with yt_dlp.YoutubeDL(opts) as ydl:
+                            ydl.download([url])
+                        logger.info("Client '%s' worked", name)
+                        return
+                    except Exception as e:
+                        last_err = e
+                        logger.warning(
+                            "Client '%s' failed: %s", name, str(e)[:200]
+                        )
+                raise last_err
 
             await asyncio.to_thread(download)
 
