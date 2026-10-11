@@ -170,13 +170,11 @@ async def handle_url(
 
             await status.delete()
 
-    except Exception:
+    except Exception as e:
         logger.exception("YouTube download failed")
-
+    
         await status.edit_text(
-            "❌ دانلود ناموفق بود.\n"
-            "ممکن است ویدئو در دسترس نباشد، "
-            "دانلود آن مجاز نباشد یا حجم آن بیش از حد مجاز باشد."
+            f"❌ خطا:\n{str(e)[:700]}"
         )
 
 
