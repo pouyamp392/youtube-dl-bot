@@ -9,11 +9,23 @@ from tempfile import TemporaryDirectory
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
 
-from telegram import Update, LinkPreviewOptions
+import httpx
+from telegram import (
+    Update,
+    LinkPreviewOptions,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    BotCommand,
+    BotCommandScopeDefault,
+    BotCommandScopeAllPrivateChats,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
@@ -29,6 +41,10 @@ os.environ["PATH"] = (
 )
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+
+# تنظیمات عضویت اجباری از طریق ربات ادمین مرکزی
+ADMIN_API_URL = os.getenv("ADMIN_API_URL", "https://admin-dl-bot.onrender.com").rstrip("/")
+API_KEY = os.getenv("API_KEY", "")
 
 # مسیر فایل کوکی (روی Render مقدارش مسیر Secret File است:
 # /etc/secrets/cookies.txt  — نه محتوای کوکی!)
@@ -71,25 +87,23 @@ LARGE_MAX_SIZE = LARGE_MAX_MB * 1024 * 1024
 # کلاینت Telethon (برای ارسال فایل بزرگ) داخل post_init ساخته می‌شود
 tclient = None
 
+# ⚠️ متن دکمه استارت — همه‌جا از همین استفاده می‌شود
+START_BUTTON_TEXT = "🚀 استارت"
+
 
 # ---------------- Cookie Helper ----------------
 
 def prepare_cookie_file(src: str, dst: Path) -> int:
-    """فایل کوکی را به فرمت درست Netscape (با Tab) تبدیل می‌کند.
-
-    اگر موقع Paste کردن Tabها به فاصله تبدیل شده باشند یا خط اول
-    افتاده باشد، اینجا درست می‌شود. تعداد کوکی‌های معتبر را برمی‌گرداند.
-    """
+    """فایل کوکی را به فرمت درست Netscape (با Tab) تبدیل می‌کند."""
     lines = ["# Netscape HTTP Cookie File"]
     with open(src, encoding="utf-8", errors="ignore") as f:
         for raw in f:
             line = raw.replace("\ufeff", "").strip()
             if not line:
                 continue
-            # کامنت‌ها رد می‌شوند، ولی #HttpOnly_ یک کوکی واقعی است
             if line.startswith("#") and not line.startswith("#HttpOnly_"):
                 continue
-            parts = line.split(None, 6)  # جداکردن با هر نوع فاصله، حداکثر ۷ ستون
+            parts = line.split(None, 6)
             if len(parts) < 7:
                 continue
             lines.append("\t".join(parts))
@@ -131,6 +145,40 @@ def start_health_server():
     server.serve_forever()
 
 
+# ---------------- Bot Commands (منوی آبی کنار کیبورد) ----------------
+
+async def setup_bot_commands(app: Application):
+    commands = [
+        BotCommand("start", START_BUTTON_TEXT),
+    ]
+
+    await app.bot.set_my_commands(
+        commands,
+        scope=BotCommandScopeDefault(),
+    )
+
+    await app.bot.set_my_commands(
+        commands,
+        scope=BotCommandScopeAllPrivateChats(),
+    )
+
+    logger.info("Bot commands configured.")
+
+
+# ---------------- Reply Keyboard (کیبورد پایین) ----------------
+
+def get_main_reply_keyboard() -> ReplyKeyboardMarkup:
+    keyboard = [
+        [KeyboardButton(START_BUTTON_TEXT)],
+    ]
+    return ReplyKeyboardMarkup(
+        keyboard,
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="لینک یوتیوب را بفرست یا استارت بزن...",
+    )
+
+
 # ---------------- URL Validation ----------------
 
 def is_youtube_url(url: str) -> bool:
@@ -152,8 +200,14 @@ def is_youtube_url(url: str) -> bool:
 # ---------------- Large upload (Telethon) ----------------
 
 async def post_init(application: Application):
-    """کلاینت Telethon را با همان توکن ربات راه می‌اندازد (برای فایل‌های بزرگ)."""
+    """هم Telethon را راه می‌اندازد، هم منوی آبی را تنظیم می‌کند."""
     global tclient
+
+    # ⚠️ اول منوی آبی را تنظیم می‌کنیم تا از همان ابتدا در دسترس باشد
+    try:
+        await setup_bot_commands(application)
+    except Exception:
+        logger.exception("Failed to set bot commands")
 
     if not (API_ID and API_HASH):
         logger.info("API_ID/API_HASH not set: large uploads disabled")
@@ -166,7 +220,6 @@ async def post_init(application: Application):
         client = TelegramClient(StringSession(), int(API_ID), API_HASH)
         await client.start(bot_token=BOT_TOKEN)
 
-        # وجود یک handler باعث می‌شود آپدیت‌ها پردازش و کاربرها کش شوند
         @client.on(events.NewMessage(incoming=True))
         async def _cache_entities(event):
             pass
@@ -182,7 +235,6 @@ async def send_large_video(chat_id: int, path: Path, info: dict, caption: str):
     """ارسال ویدئوی بزرگ با Telethon. در صورت خطا exception می‌دهد."""
     from telethon.tl.types import DocumentAttributeVideo
 
-    # کاربر باید توسط Telethon دیده شده باشد؛ چند بار تلاش می‌کنیم
     entity = None
     for _ in range(5):
         try:
@@ -213,17 +265,144 @@ async def send_large_video(chat_id: int, path: Path, info: dict, caption: str):
     )
 
 
+# ---------------- Mandatory Join (Central Admin API) ----------------
+
+async def check_membership(user_id: int):
+    """خروجی: (اجازه دسترسی, کانال‌های باقی‌مانده برای عضویت)."""
+    if not API_KEY:
+        logger.error("API_KEY is not configured; mandatory join check is blocked")
+        return False, []
+
+    try:
+        async with httpx.AsyncClient(timeout=12, follow_redirects=True) as client:
+            response = await client.get(
+                f"{ADMIN_API_URL}/api/check",
+                params={"user_id": user_id},
+                headers={"X-API-Key": API_KEY},
+            )
+            response.raise_for_status()
+            data = response.json()
+
+        if data.get("enabled") is False:
+            return True, []
+
+        missing = data.get("missing") or []
+        allowed = bool(data.get("ok")) and not missing
+        return allowed, missing
+    except Exception:
+        logger.exception("Central membership API request failed")
+        return False, []
+
+
+def _channel_value(channel, *keys):
+    if isinstance(channel, dict):
+        for key in keys:
+            value = channel.get(key)
+            if value:
+                return str(value)
+        return ""
+    return str(channel) if channel else ""
+
+
+async def membership_markup(missing):
+    """دکمه‌های عضویت را از اطلاعات کانال‌های برگشتی API می‌سازد."""
+    rows = []
+    channels = missing if all(isinstance(item, dict) for item in missing) else []
+    if missing and not channels:
+        try:
+            async with httpx.AsyncClient(timeout=12, follow_redirects=True) as client:
+                response = await client.get(
+                    f"{ADMIN_API_URL}/api/channels",
+                    headers={"X-API-Key": API_KEY},
+                )
+                response.raise_for_status()
+                payload = response.json()
+            all_channels = payload.get("channels", payload) if isinstance(payload, dict) else payload
+            if isinstance(all_channels, list):
+                wanted = {str(item).lstrip("@").lower() for item in missing}
+                for channel in all_channels:
+                    if not isinstance(channel, dict):
+                        continue
+                    identifiers = {
+                        _channel_value(channel, "id", "channel_id", "username", "channel", "chat_id").lstrip("@").lower(),
+                        _channel_value(channel, "username", "channel", "chat_id").lstrip("@").lower(),
+                    }
+                    if wanted.intersection(identifiers):
+                        channels.append(channel)
+        except Exception:
+            logger.exception("Could not load channel buttons from central API")
+
+    for channel in channels:
+        url = _channel_value(channel, "join_url", "url", "invite_link", "channel_url", "link")
+        name = _channel_value(channel, "title", "name", "username", "channel") or "عضویت در کانال"
+        if url.startswith("http://") or url.startswith("https://"):
+            rows.append([InlineKeyboardButton(f"عضویت در {name}", url=url)])
+
+    rows.append([InlineKeyboardButton("✅ عضو شدم؛ بررسی دوباره", callback_data="join:check")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def require_membership(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    user = update.effective_user
+    message = update.effective_message
+    if not user or not message:
+        return False
+
+    allowed, missing = await check_membership(user.id)
+    if allowed:
+        return True
+
+    await message.reply_text(
+        "🔒 برای استفاده از ربات، ابتدا در کانال‌های زیر عضو شو؛ سپس روی «عضو شدم» بزن.",
+        reply_markup=await membership_markup(missing),
+    )
+    return False
+
+
+async def on_join_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    allowed, missing = await check_membership(query.from_user.id)
+    if allowed:
+        await query.edit_message_text(
+            "✅ عضویتت تأیید شد. حالا لینک ویدئوی یوتیوب را برای ربات بفرست."
+        )
+    else:
+        await query.edit_message_text(
+            "❌ هنوز عضویتت تأیید نشده. در کانال‌های لازم عضو شو و دوباره بررسی کن.",
+            reply_markup=await membership_markup(missing),
+        )
+
+
 # ---------------- Bot Commands ----------------
 
 async def start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+    if not await require_membership(update, context):
+        return
+    # ⚠️ کیبورد پایین همیشه همراه پیام استارت ارسال می‌شود
     await update.effective_message.reply_text(
         "سلام 👋\n\n"
         "لینک ویدئوی یوتیوب را بفرست.\n"
-        "ویدئوهای متعلق به خودت یا دارای مجوز دانلود پشتیبانی می‌شوند. 🎬"
+        "ویدئوهای متعلق به خودت یا دارای مجوز دانلود پشتیبانی می‌شوند. 🎬",
+        reply_markup=get_main_reply_keyboard(),
     )
+
+
+# ---------------- هندلر دکمه استارت از کیبورد پایین ----------------
+
+async def handle_reply_keyboard(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    message = update.effective_message
+    if not message or not message.text:
+        return
+
+    if message.text.strip() == START_BUTTON_TEXT:
+        await start(update, context)
 
 
 async def handle_url(
@@ -231,6 +410,9 @@ async def handle_url(
     context: ContextTypes.DEFAULT_TYPE,
 ):
     message = update.effective_message
+
+    if not await require_membership(update, context):
+        return
 
     if not message or not message.text:
         return
@@ -255,18 +437,13 @@ async def handle_url(
 
             ydl_opts = {
                 "outtmpl": output_template,
-                # لاگ کامل‌تر برای پیدا کردن دلیل خطا
                 "quiet": False,
                 "no_warnings": False,
                 "noplaylist": True,
                 "socket_timeout": 30,
-                # معادل --remote-components ejs:github در خط فرمان
                 "remote_components": ["ejs:github"],
             }
 
-            # کپی کوکی داخل پوشه‌ی موقت، چون yt-dlp می‌خواد
-            # بعد از اجرا دوباره توی فایل کوکی بنویسه و ممکنه
-            # فایل اصلی (مثلاً Secret File) فقط‌خواندنی باشه.
             if os.path.exists(COOKIES_PATH):
                 cookie_copy = Path(tmpdir) / "cookies.txt"
                 count = prepare_cookie_file(COOKIES_PATH, cookie_copy)
@@ -280,13 +457,9 @@ async def handle_url(
             else:
                 logger.warning("Cookie file not found: %s", COOKIES_PATH)
 
-            # Download runs outside the async event loop.
-            # چند کلاینت یوتیوب را پشت‌سرهم امتحان می‌کنیم؛ روی آی‌پی
-            # دیتاسنتر (مثل Render) بعضی کلاینت‌ها کمتر بات‌چک می‌شوند.
             def download(limit: int):
                 attempts = [
-                    # (اسم، extractor_args، استفاده از کوکی؟)
-                    ("default", None, True),  # پیش‌فرض yt-dlp + کوکی
+                    ("default", None, True),
                     ("tv", {"youtube": {"player_client": ["tv"]}}, False),
                     ("mweb", {"youtube": {"player_client": ["mweb"]}}, False),
                 ]
@@ -309,12 +482,10 @@ async def handle_url(
                         logger.warning(
                             "Client '%s' failed: %s", name, str(e)[:200]
                         )
-                        # مشکل «حجم زیاد» به کلاینت ربطی ندارد؛ بقیه را امتحان نکن
                         if is_format_unavailable(e):
                             raise
                 raise last_err
 
-            # لینک مستقیم، برای وقتی که ویدئو از همه‌ی سقف‌ها بزرگ‌تر است
             def get_direct_link():
                 opts = dict(ydl_opts)
                 opts["format"] = "best[ext=mp4]/best"
@@ -324,14 +495,12 @@ async def handle_url(
 
             info = None
 
-            # مرحله ۱: نسخه‌ی کوچک‌تر از ۵۰ مگابایت (ارسال عادی)
             try:
                 info = await asyncio.to_thread(download, MAX_FILE_SIZE)
             except Exception as e:
                 if not is_format_unavailable(e):
                     raise
 
-            # مرحله ۲: ویدئوی بزرگ‌تر، با Telethon (اگر فعال باشد)
             if info is None and tclient is not None:
                 await status.edit_text(
                     "⏳ ویدئو بزرگ‌تر از ۵۰ مگابایت است؛ در حال دانلود نسخه‌ی کامل "
@@ -343,7 +512,6 @@ async def handle_url(
                     if not is_format_unavailable(e):
                         raise
 
-            # مرحله ۳: هیچ فرمتی زیر سقف نبود → لینک مستقیم
             if info is None:
                 await status.edit_text(
                     "⏳ ویدئو از سقف مجاز بزرگ‌تر است؛ در حال ساخت لینک مستقیم..."
@@ -369,7 +537,6 @@ async def handle_url(
                 )
                 return
 
-            # فقط فایل‌های کامل ویدیویی؛ فایل‌های ناقص (.part) و کوکی رد می‌شوند
             video_exts = {".mp4", ".mkv", ".webm", ".mov"}
             files = [
                 p for p in Path(tmpdir).iterdir()
@@ -383,7 +550,6 @@ async def handle_url(
                     "Downloaded video was not found"
                 )
 
-            # Select the largest output file.
             filename = max(
                 files,
                 key=lambda p: p.stat().st_size
@@ -395,7 +561,6 @@ async def handle_url(
             )
 
             if file_size <= MAX_FILE_SIZE:
-                # ارسال عادی با Bot API
                 with filename.open("rb") as video:
                     await context.bot.send_video(
                         chat_id=message.chat_id,
@@ -411,7 +576,6 @@ async def handle_url(
                         pool_timeout=30,
                     )
             else:
-                # ارسال فایل بزرگ با Telethon
                 await send_large_video(
                     message.chat_id,
                     filename,
@@ -445,6 +609,18 @@ def main():
     )
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(on_join_check, pattern=r"^join:check$"))
+
+    # ⚠️ هندلر دکمه استارت از کیبورد پایین — دقیقاً قبل از handle_url
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND & filters.Regex(
+                rf"^{re.escape(START_BUTTON_TEXT)}$"
+            ),
+            handle_reply_keyboard,
+        )
+    )
+
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
